@@ -237,4 +237,27 @@ http.createServer((req, res) => {
   console.log(`📡 Health-check HTTP escuchando en puerto ${PORT} (listo para Render)`);
 });
 
-bot.startPolling();
+// Auto-ping anti-suspensión para Render (cada 10 minutos para evitar que se duerma)
+const KEEP_ALIVE_URL = process.env.RENDER_EXTERNAL_URL || 'https://economiton.onrender.com';
+setInterval(() => {
+  console.log(`⏰ Enviando ping keep-alive a ${KEEP_ALIVE_URL}...`);
+  axios.get(KEEP_ALIVE_URL)
+    .then(() => console.log('✅ Keep-alive exitoso (evita suspensión de Render)'))
+    .catch((err) => console.log('ℹ️ Keep-alive ping:', err.message));
+}, 10 * 60 * 1000); // 10 minutos
+
+// Bucle de conexión con reconexión automática si se corta o hay conflicto
+async function runBot() {
+  while (true) {
+    try {
+      console.log('🔄 Conectando polling con Telegram...');
+      await bot.startPolling();
+    } catch (err) {
+      console.error('⚠️ Error en polling de Telegram:', err.message);
+      console.log('⏳ Reintentando conexión en 5 segundos...');
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+  }
+}
+
+runBot();
