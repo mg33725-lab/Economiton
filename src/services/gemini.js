@@ -9,7 +9,7 @@ function getGenAI() {
   return new GoogleGenAI({ apiKey });
 }
 
-const CANDIDATE_MODELS = ['gemini-3.5-flash', 'gemini-3.8-flash', 'gemini-3.1-flash-lite'];
+const CANDIDATE_MODELS = ['gemini-3.1-flash-lite', 'gemini-3.5-flash', 'gemini-3.8-flash'];
 
 const SYSTEM_PROMPT = `
 Eres un asistente contable y financiero personal inteligente especializado en Argentina/Latinoamérica.
@@ -51,13 +51,19 @@ async function generateWithFallback(contents) {
 
   for (const model of CANDIDATE_MODELS) {
     try {
-      const response = await ai.models.generateContent({
+      const generatePromise = ai.models.generateContent({
         model,
         contents,
         config: {
           responseMimeType: 'application/json'
         }
       });
+
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`Timeout en ${model} tras 8s`)), 8000)
+      );
+
+      const response = await Promise.race([generatePromise, timeoutPromise]);
       return response.text;
     } catch (err) {
       console.warn(`⚠️ Modelo ${model} falló (${err.status || err.message}). Probando alternativo...`);
