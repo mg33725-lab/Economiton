@@ -3,7 +3,13 @@ const http = require('http');
 const { Bot } = require('node-telegram-bot-api');
 const axios = require('axios');
 const { parseExpenseFromText, parseExpenseFromAudio } = require('./services/gemini');
-const { recordExpense, getMonthlyStatsFromCsv, resetLocalCsv } = require('./services/sheets');
+const {
+  recordExpense,
+  undoLastExpense,
+  editLastExpense,
+  getSyncedMonthlyStats,
+  resetLocalCsv
+} = require('./services/sheets');
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 
@@ -30,7 +36,7 @@ function getSenderName(ctx) {
 const bot = new Bot(token);
 
 async function responderResumen(ctx) {
-  const stats = getMonthlyStatsFromCsv();
+  const stats = await getSyncedMonthlyStats();
   let desglose = '';
   for (const [p, total] of Object.entries(stats.porPersona)) {
     desglose += `• *${p}:* ${formatCurrency(total)}\n`;
@@ -45,6 +51,56 @@ async function responderResumen(ctx) {
   await ctx.reply(replySummary, { parse_mode: 'Markdown' });
 }
 
+async function ejecutarDeshacer(ctx) {
+  const result = await undoLastExpense();
+  if (!result.ok || !result.deleted) {
+    await ctx.reply('ℹ️ No hay gastos recientes para deshacer.');
+    return;
+  }
+
+  let desgloseMensual = Object.entries(result.stats.porPersona || {})
+    .map(([p, m]) => `${p}: ${formatCurrency(m)}`)
+    .join(' | ');
+
+  await ctx.reply(
+    `🗑️ *Último Gasto Eliminado*\n\n` +
+    `❌ *Se borró:* ${formatCurrency(result.deleted.monto)} en *${result.deleted.comercio}* (${result.deleted.detalle})\n\n` +
+    `📊 *Nuevo total del mes:* ${formatCurrency(result.stats.totalMes)}\n` +
+    (desgloseMensual ? `(${desgloseMensual})` : ''),
+    { parse_mode: 'Markdown' }
+  );
+}
+
+async function ejecutarEdicion(ctx, parsed) {
+  const result = await editLastExpense({
+    monto: parsed.monto,
+    comercio: parsed.comercio,
+    detalle: parsed.detalle,
+    categoria: parsed.categoria
+  });
+
+  if (!result.ok || !result.updated) {
+    await ctx.reply('ℹ️ No encontré un último gasto para editar.');
+    return;
+  }
+
+  let desgloseMensual = Object.entries(result.stats.porPersona || {})
+    .map(([p, m]) => `${p}: ${formatCurrency(m)}`)
+    .join(' | ');
+
+  await ctx.reply(
+    `✏️ *Último Gasto Corregido*\n\n` +
+    `💵 *Monto:* ${formatCurrency(result.updated.monto)} _(antes: ${formatCurrency(result.previousMonto)})_\n` +
+    `🏪 *Lugar:* ${result.updated.comercio}\n` +
+    `🏷️ *Categoría:* ${result.updated.categoria}\n` +
+    `📝 *Detalle:* ${result.updated.detalle}\n\n` +
+    `📊 *Nuevo total del mes:* ${formatCurrency(result.stats.totalMes)}\n` +
+    (desgloseMensual ? `(${desgloseMensual})\n` : '') +
+    `☁️ _Actualizado en tu planilla_`,
+    { parse_mode: 'Markdown' }
+  );
+}
+
 // Comando /start
 bot.command('start', async (ctx) => {
   const name = getSenderName(ctx);
@@ -53,11 +109,11 @@ bot.command('start', async (ctx) => {
     `Podés mandarme *audios* o *textos* cada vez que hagas un gasto:\n` +
     `🎙️ _"Gasté 10 mil pesos en el kiosco comprando alfajores"_\n` +
     `💬 _"45 lucas de nafta en la YPF"_\n\n` +
-    `Yo me encargo de:\n` +
-    `✅ Extraer el monto exacto, comercio y categoría con IA (Gemini).\n` +
-    `✅ Anotarlo en tu planilla y en el archivo local.\n` +
-    `✅ Llevar el control mensual de cuánto van gastando vos y tu mujer.\n\n` +
-    `📌 *Comando útil:* preguntame _"¿Cuánto gastamos en el mes?"_ o escribí /resumen para ver el balance.`;
+    `*¿Te equivocaste o escuché mal un audio?*\n` +
+    `✏️ Decime o escribí: _"Corregí el último, eran 5 mil pesos en la panadería"_ (o usá \`/editar 5000 panadería\`).\n` +
+    `🗑️ Escribí \`/deshacer\` o decime _"borrá el último gasto"_ para eliminar el último anotado.\n` +
+    `🧹 Escribí \`/reset\` para reiniciar todo el mes a $0.\n` +
+    `📊 Escribí \`/resumen\` para ver el balance actual.`;
 
   await ctx.reply(welcomeText, { parse_mode: 'Markdown' });
 });
@@ -67,14 +123,44 @@ bot.command('resumen', async (ctx) => {
   await responderResumen(ctx);
 });
 
+// Comando /deshacer para borrar el último gasto
+bot.command(['deshacer', 'undo', 'borrarultimo'], async (ctx) => {
+  await ejecutarDeshacer(ctx);
+});
+
+// Comando /editar para corregir el último gasto (ej: /editar 5000 kiosco)
+bot.command(['editar', 'corregir'], async (ctx) => {
+  const fullText = ctx.message?.text || '';
+  const args = fullText.replace(/^\/(editar|corregir)(@\S+)?\s*/i, '').trim();
+  if (!args) {
+    await ctx.reply(
+      `✏️ *¿Cómo editar el último gasto?*\n\n` +
+      `Podés escribir el comando seguido de la corrección, por ejemplo:\n` +
+      `• \`/editar 5000\` _(cambia solo el monto a $5.000)_\n` +
+      `• \`/editar 12000 carnicería asado\` _(cambia monto, comercio y detalle)_\n\n` +
+      `🎙️ _También podés mandarme un audio o texto normal diciendo: "Corregí el último gasto, eran 5 mil pesos"._`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
+  try {
+    const parsed = await parseExpenseFromText(`Corregir el último gasto a: ${args}`);
+    await ejecutarEdicion(ctx, parsed);
+  } catch (err) {
+    console.error('❌ Error en comando /editar:', err);
+    await ctx.reply('⚠️ No pude procesar la edición. Probá escribiendo `/editar 5000 comercio`.', { parse_mode: 'Markdown' });
+  }
+});
+
 // Comando /reset para poner el balance en $0
 bot.command(['reset', 'borrar', 'limpiar'], async (ctx) => {
   resetLocalCsv();
   console.log('🧹 Gastos reseteados a $0 por usuario.');
   await ctx.reply(
     `🧹 *Gastos reseteados con éxito*\n\n` +
-    `El balance mensual del bot vuelve a *$0*.\n\n` +
-    `💡 _Nota: Para borrar las filas viejas en Google Sheets, simplemente entrá a tu planilla y borralas normalmente._`,
+    `El balance mensual del bot y de la pestaña actual vuelve a *$0*.\n\n` +
+    `💡 _Nota: También podés borrar filas manualmente en Google Sheets y el bot se sincronizará solo._`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -92,7 +178,7 @@ bot.on('message', async (ctx) => {
     console.log(`\n🎙️ Audio recibido de ${persona} (${media.duration || 0} seg)...`);
 
     // Mensaje temporal para que el usuario sepa que la IA está trabajando
-    const statusMsg = await ctx.reply('🎧 _Escuchando audio y calculando gasto..._', { parse_mode: 'Markdown' });
+    await ctx.reply('🎧 _Escuchando audio y calculando gasto..._', { parse_mode: 'Markdown' });
 
     try {
       const fileId = media.file_id;
@@ -106,6 +192,16 @@ bot.on('message', async (ctx) => {
       console.log(`🧠 Procesando audio con Google Gemini...`);
       const parsed = await parseExpenseFromAudio(audioBuffer, 'audio/ogg');
       console.log('📦 Resultado IA:', JSON.stringify(parsed));
+
+      if (parsed && parsed.accion === 'borrar_ultimo') {
+        await ejecutarDeshacer(ctx);
+        return;
+      }
+
+      if (parsed && parsed.accion === 'editar_ultimo') {
+        await ejecutarEdicion(ctx, parsed);
+        return;
+      }
 
       if (parsed && parsed.es_gasto && parsed.monto > 0) {
         const { expenseData, stats, savedToSheets } = await recordExpense({
@@ -130,12 +226,14 @@ bot.on('message', async (ctx) => {
           `👤 *Anotado por:* ${persona}\n\n` +
           `📊 *Total mes:* ${formatCurrency(stats.totalMes)}\n` +
           `(${desgloseMensual})\n` +
-          (savedToSheets ? `☁️ _Sincronizado con Google Sheets_` : `📁 _Anotado en planilla_`);
+          (savedToSheets ? `☁️ _Sincronizado con Google Sheets_` : `📁 _Anotado en planilla_`) +
+          `\n\n💡 _Si escuché mal algo, decime "corregí el último, eran X pesos" o escribí /deshacer._`;
 
         await ctx.reply(confirmation, { parse_mode: 'Markdown' });
       } else {
         await ctx.reply(
-          `ℹ️ No llegué a detectar un gasto en el audio.\nProbá diciendo claramente: *"Gasté 10 mil pesos en el kiosco"*`
+          `ℹ️ No llegué a detectar un gasto en el audio.\nProbá diciendo claramente: *"Gasté 10 mil pesos en el kiosco"*`,
+          { parse_mode: 'Markdown' }
         );
       }
     } catch (error) {
@@ -153,15 +251,19 @@ bot.on('message', async (ctx) => {
     console.log(`\n💬 Texto recibido de ${persona}: "${text}"`);
 
     const lower = text.toLowerCase();
-    if (lower.includes('resetear') || lower.includes('borrar gastos') || lower.includes('reiniciar gastos') || lower.includes('limpiar gastos')) {
+    if (lower.includes('resetear') || lower.includes('borrar todos los gastos') || lower.includes('reiniciar gastos') || lower.includes('limpiar gastos')) {
       resetLocalCsv();
       console.log('🧹 Gastos reseteados a $0 por usuario.');
       await ctx.reply(
         `🧹 *Gastos reseteados con éxito*\n\n` +
-        `El balance mensual del bot vuelve a *$0*.\n\n` +
-        `💡 _Nota: Para borrar las filas viejas en Google Sheets, simplemente entrá a tu planilla y borralas normalmente._`,
+        `El balance mensual del bot vuelve a *$0*.`,
         { parse_mode: 'Markdown' }
       );
+      return;
+    }
+
+    if (lower === 'deshacer' || lower.includes('borrar el ultimo') || lower.includes('borrar el último') || lower.includes('borra el ultimo') || lower.includes('borrá el último')) {
+      await ejecutarDeshacer(ctx);
       return;
     }
 
@@ -174,6 +276,16 @@ bot.on('message', async (ctx) => {
       console.log('🧠 Analizando texto con Google Gemini...');
       const parsed = await parseExpenseFromText(text);
       console.log('📦 Resultado IA:', JSON.stringify(parsed));
+
+      if (parsed && parsed.accion === 'borrar_ultimo') {
+        await ejecutarDeshacer(ctx);
+        return;
+      }
+
+      if (parsed && parsed.accion === 'editar_ultimo') {
+        await ejecutarEdicion(ctx, parsed);
+        return;
+      }
 
       if (parsed && parsed.es_gasto && parsed.monto > 0) {
         const { expenseData, stats, savedToSheets } = await recordExpense({

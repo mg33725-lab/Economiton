@@ -13,7 +13,11 @@ const CANDIDATE_MODELS = ['gemini-3.1-flash-lite', 'gemini-3.5-flash', 'gemini-3
 
 const SYSTEM_PROMPT = `
 Eres un asistente contable y financiero personal inteligente especializado en Argentina/Latinoamérica.
-Tu objetivo es analizar un mensaje (que puede ser una transcripción de voz o texto escrito) y extraer los datos de un gasto para anotarlo en un presupuesto familiar.
+Tu objetivo es analizar un mensaje (que puede ser una transcripción de voz o texto escrito) y determinar si el usuario quiere:
+1. Registrar un gasto nuevo ("accion": "nuevo_gasto")
+2. Corregir o editar el último gasto enviado ("accion": "editar_ultimo") — ej: "corregí el último, eran 5 mil", "no eran 30 mil, eran 3 mil", "editá el anterior a 8000 en la carnicería", "te equivocaste, puse 4000".
+3. Borrar o deshacer el último gasto ("accion": "borrar_ultimo") — ej: "borrá el último gasto", "deshacer el último", "eliminá el anterior que me equivoqué".
+4. Otra consulta que no es gasto ("accion": "ninguna").
 
 Ten en cuenta modismos y expresiones comunes:
 - "33 mil", "33 lucas", "33k" -> monto: 33000
@@ -23,16 +27,18 @@ Ten en cuenta modismos y expresiones comunes:
 
 Debes responder ÚNICAMENTE con un objeto JSON válido con la siguiente estructura:
 {
+  "accion": "nuevo_gasto" | "editar_ultimo" | "borrar_ultimo" | "ninguna",
   "es_gasto": true | false,
-  "monto": number (ej: 33000, sin puntos ni signos, solo número entero o decimal si corresponde),
+  "monto": number (ej: 33000, o 0 si no se menciona monto),
   "comercio": string (ej: "Kiosco", "Coto", "Farmacity", "YPF", o "Desconocido" si no se menciona),
-  "detalle": string (descripción breve del gasto, ej: "Alfajor y gaseosa", "Carga de combustible", "Remedio"),
+  "detalle": string (descripción breve del gasto, ej: "Alfajor y gaseosa", o "Sin detalle" si no se menciona),
   "categoria": string (una de las siguientes categorías estándar: "Comida/Supermercado", "Kiosco/Snacks", "Transporte/Combustible", "Servicios/Impuestos", "Salud/Farmacia", "Salidas/Ocio", "Ropa/Calzado", "Hogar/Mantenimiento", "Otros"),
   "observacion": string (si falta algún dato clave o si no parece un gasto)
 }
 
-Si el usuario dice algo que NO es un gasto (ej: "Hola bot", "¿Cuánto gastamos?", "Buenas tardes"), responde con "es_gasto": false y en observacion explica brevemente.
-NO agregues texto fuera del JSON.
+Nota importante:
+- Si "accion" es "editar_ultimo", pon en "monto", "comercio", "detalle" y "categoria" los nuevos valores corregidos (si el usuario solo corrigió el monto, ej: "no, eran 3 mil", pon monto: 3000, comercio: "Desconocido", detalle: "Sin detalle", categoria: "Otros").
+- NO agregues texto fuera del JSON.
 `;
 
 function cleanJsonText(rawText) {
@@ -75,7 +81,7 @@ async function generateWithFallback(contents) {
 }
 
 /**
- * Analiza un mensaje de texto para extraer los datos del gasto.
+ * Analiza un mensaje de texto para extraer los datos del gasto o acción.
  */
 async function parseExpenseFromText(text) {
   const prompt = `${SYSTEM_PROMPT}\n\nMensaje a analizar: "${text}"`;
@@ -91,7 +97,7 @@ async function parseExpenseFromText(text) {
 }
 
 /**
- * Analiza un audio (nota de voz de WhatsApp) para extraer los datos del gasto.
+ * Analiza un audio (nota de voz) para extraer los datos del gasto o acción.
  */
 async function parseExpenseFromAudio(audioBuffer, mimeType = 'audio/ogg') {
   const contents = [
@@ -101,7 +107,7 @@ async function parseExpenseFromAudio(audioBuffer, mimeType = 'audio/ogg') {
         mimeType: mimeType || 'audio/ogg'
       }
     },
-    `${SYSTEM_PROMPT}\n\nEscucha atentamente este audio de WhatsApp y extrae los datos del gasto según las instrucciones.`
+    `${SYSTEM_PROMPT}\n\nEscucha atentamente este audio y extrae los datos del gasto o corrección según las instrucciones.`
   ];
 
   const rawResponse = await generateWithFallback(contents);

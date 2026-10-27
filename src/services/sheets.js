@@ -1,10 +1,19 @@
 const fs = require('fs');
 const path = require('path');
+const axios = require('axios');
 const { google } = require('googleapis');
 
 const CSV_FILE_PATH = path.join(__dirname, '..', '..', 'gastos.csv');
+const DEFAULT_SHEETS_URL = 'https://script.google.com/macros/s/AKfycbxdXTmMIsXvqQQQfSteeZCtIuJgHyXIqoINvzv01NLMtd-86-eiXyCt6w03Ko0eswVQ/exec';
 
-// Inicializar archivo CSV local si no existe (con BOM UTF-8 para compatibilidad directa con Excel)
+function getWebhookUrls() {
+  const urls = [DEFAULT_SHEETS_URL];
+  if (process.env.GOOGLE_SHEET_WEBHOOK_URL && process.env.GOOGLE_SHEET_WEBHOOK_URL !== DEFAULT_SHEETS_URL) {
+    urls.push(process.env.GOOGLE_SHEET_WEBHOOK_URL);
+  }
+  return urls;
+}
+
 function initLocalCsv() {
   if (!fs.existsSync(CSV_FILE_PATH)) {
     const headers = 'Fecha,Hora,Persona,Comercio,Detalle,Monto,Categoria,Mensaje Original\n';
@@ -12,17 +21,14 @@ function initLocalCsv() {
   }
 }
 
-/**
- * Guarda el gasto en el archivo CSV local.
- */
+function escapeCsv(val) {
+  if (val === null || val === undefined) return '""';
+  const str = String(val).replace(/"/g, '""');
+  return `"${str}"`;
+}
+
 function saveExpenseToLocalCsv(expenseData) {
   initLocalCsv();
-  
-  const escapeCsv = (val) => {
-    if (val === null || val === undefined) return '""';
-    const str = String(val).replace(/"/g, '""');
-    return `"${str}"`;
-  };
 
   const row = [
     escapeCsv(expenseData.fecha),
@@ -38,27 +44,23 @@ function saveExpenseToLocalCsv(expenseData) {
   fs.appendFileSync(CSV_FILE_PATH, row, 'utf8');
 }
 
-/**
- * Obtiene el total del mes actual desde el CSV local para el reporte rápido.
- */
 function getMonthlyStatsFromCsv() {
   initLocalCsv();
   const content = fs.readFileSync(CSV_FILE_PATH, 'utf8');
-  const lines = content.trim().split('\n').slice(1); // saltar headers
+  const lines = content.trim().split('\n').slice(1);
 
   const now = new Date();
-  const currentMonthYear = `${String(now.getMonth() + 1).padStart(2, '0')}/${now.getFullYear()}`; // ej: 10/2026
+  const currentMonthYear = `${String(now.getMonth() + 1).padStart(2, '0')}/${now.getFullYear()}`;
 
   let totalMes = 0;
   const porPersona = {};
 
   for (const line of lines) {
     if (!line.trim()) continue;
-    // Parse básico de CSV respetando comillas
     const matches = line.match(/(".*?"|[^",\s]+)(?=\s*,|\s*$)/g);
     if (!matches || matches.length < 6) continue;
 
-    const fecha = matches[0].replace(/"/g, ''); // "DD/MM/YYYY"
+    const fecha = matches[0].replace(/"/g, '');
     const persona = matches[2].replace(/"/g, '');
     const monto = parseFloat(matches[5].replace(/"/g, '')) || 0;
 
@@ -71,88 +73,20 @@ function getMonthlyStatsFromCsv() {
   return { totalMes, porPersona };
 }
 
-const DEFAULT_SHEETS_URL = 'https://script.google.com/macros/s/AKfycbxdXTmMIsXvqQQQfSteeZCtIuJgHyXIqoINvzv01NLMtd-86-eiXyCt6w03Ko0eswVQ/exec';
-
-/**
- * Guarda en Google Sheets mediante Webhook de Google Apps Script (el método más sencillo y rápido)
- */
-async function saveExpenseToGoogleSheetsWebhook(expenseData) {
-  const axios = require('axios');
-  const urlsToTry = [DEFAULT_SHEETS_URL];
-  if (process.env.GOOGLE_SHEET_WEBHOOK_URL && process.env.GOOGLE_SHEET_WEBHOOK_URL !== DEFAULT_SHEETS_URL) {
-    urlsToTry.push(process.env.GOOGLE_SHEET_WEBHOOK_URL);
-  }
-
+async function postToSheetsWebhook(payload) {
+  const urlsToTry = getWebhookUrls();
   for (const url of urlsToTry) {
     try {
-      const res = await axios.post(url, expenseData);
-      console.log(`📊 Envío a Google Sheets: Status ${res.status} (${res.data})`);
-      return true;
+      const res = await axios.post(url, payload, { timeout: 10000 });
+      console.log(`📊 Respuesta Google Sheets: Status ${res.status}`, typeof res.data === 'object' ? JSON.stringify(res.data) : res.data);
+      return { ok: true, data: res.data };
     } catch (err) {
       console.warn(`⚠️ Intento en ${url.slice(-15)} falló: ${err.message}`);
     }
   }
-  return false;
+  return { ok: false, data: null };
 }
 
-/**
- * Guarda en Google Sheets si están las credenciales configuradas en .env o archivo json.
- */
-async function saveExpenseToGoogleSheets(expenseData) {
-  // 1. Probar primero si hay Webhook URL configurado
-  if (process.env.GOOGLE_SHEET_WEBHOOK_URL || DEFAULT_SHEETS_URL) {
-    return await saveExpenseToGoogleSheetsWebhook(expenseData);
-  }
-
-  const spreadsheetId = process.env.GOOGLE_SHEET_ID;
-  const clientEmail = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
-  const privateKey = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
-
-  if (!spreadsheetId || !clientEmail || !privateKey) {
-    // Si no están configuradas las credenciales de Google Sheets, operamos en modo CSV local
-    return false;
-  }
-
-  try {
-    const auth = new google.auth.JWT(
-      clientEmail,
-      null,
-      privateKey,
-      ['https://www.googleapis.com/auth/spreadsheets']
-    );
-
-    const sheets = google.sheets({ version: 'v4', auth });
-
-    // Agregar fila en la hoja 'Gastos'
-    await sheets.spreadsheets.values.append({
-      spreadsheetId,
-      range: 'Gastos!A:H',
-      valueInputOption: 'USER_ENTERED',
-      resource: {
-        values: [[
-          expenseData.fecha,
-          expenseData.hora,
-          expenseData.persona,
-          expenseData.comercio,
-          expenseData.detalle,
-          expenseData.monto,
-          expenseData.categoria,
-          expenseData.mensajeOriginal
-        ]]
-      }
-    });
-
-    return true;
-  } catch (error) {
-    console.error('Error al guardar en Google Sheets:', error.message);
-    return false;
-  }
-}
-
-/**
- * Función principal que guarda el gasto tanto en CSV local (backup siempre disponible)
- * como en Google Sheets si está configurado.
- */
 async function recordExpense({ persona, monto, comercio, detalle, categoria, mensajeOriginal }) {
   const now = new Date();
   const fecha = `${String(now.getDate()).padStart(2, '0')}/${String(now.getMonth() + 1).padStart(2, '0')}/${now.getFullYear()}`;
@@ -169,14 +103,17 @@ async function recordExpense({ persona, monto, comercio, detalle, categoria, men
     mensajeOriginal: mensajeOriginal || ''
   };
 
-  // 1. Guardar en CSV local (funciona sin internet y sin configurar nada extra)
+  // 1. Guardar en CSV local
   saveExpenseToLocalCsv(expenseData);
 
-  // 2. Guardar en Google Sheets (si está configurado)
-  const savedToSheets = await saveExpenseToGoogleSheets(expenseData);
+  // 2. Guardar en Google Sheets y obtener las estadísticas reales si el script devuelve JSON
+  const sheetRes = await postToSheetsWebhook(expenseData);
+  const savedToSheets = sheetRes.ok;
 
-  // 3. Obtener resumen acumulado del mes
-  const stats = getMonthlyStatsFromCsv();
+  let stats = getMonthlyStatsFromCsv();
+  if (sheetRes.ok && sheetRes.data && typeof sheetRes.data === 'object' && sheetRes.data.stats) {
+    stats = sheetRes.data.stats;
+  }
 
   return {
     expenseData,
@@ -185,18 +122,151 @@ async function recordExpense({ persona, monto, comercio, detalle, categoria, men
   };
 }
 
-// Reiniciar archivo CSV local y Google Sheets a cero
+/**
+ * Deshace (elimina) el último gasto registrado tanto en CSV local como en Google Sheets.
+ */
+async function undoLastExpense() {
+  initLocalCsv();
+  const content = fs.readFileSync(CSV_FILE_PATH, 'utf8');
+  const lines = content.trim().split('\n');
+
+  let deletedLocal = null;
+  if (lines.length > 1) {
+    const lastLine = lines.pop();
+    const matches = lastLine.match(/(".*?"|[^",\s]+)(?=\s*,|\s*$)/g);
+    if (matches && matches.length >= 7) {
+      deletedLocal = {
+        fecha: matches[0].replace(/"/g, ''),
+        hora: matches[1].replace(/"/g, ''),
+        persona: matches[2].replace(/"/g, ''),
+        comercio: matches[3].replace(/"/g, ''),
+        detalle: matches[4].replace(/"/g, ''),
+        monto: parseFloat(matches[5].replace(/"/g, '')) || 0,
+        categoria: matches[6].replace(/"/g, '')
+      };
+    }
+    fs.writeFileSync(CSV_FILE_PATH, lines.join('\n') + '\n', 'utf8');
+  }
+
+  const sheetRes = await postToSheetsWebhook({ action: 'undo' });
+  let stats = getMonthlyStatsFromCsv();
+  let deleted = deletedLocal;
+
+  if (sheetRes.ok && sheetRes.data && typeof sheetRes.data === 'object') {
+    if (sheetRes.data.stats) stats = sheetRes.data.stats;
+    if (sheetRes.data.deleted) deleted = sheetRes.data.deleted;
+  }
+
+  return {
+    ok: Boolean(deleted),
+    deleted,
+    stats
+  };
+}
+
+/**
+ * Edita el último gasto registrado tanto en CSV local como en Google Sheets.
+ */
+async function editLastExpense({ monto, comercio, detalle, categoria }) {
+  initLocalCsv();
+  const content = fs.readFileSync(CSV_FILE_PATH, 'utf8');
+  const lines = content.trim().split('\n');
+
+  let updatedLocal = null;
+  let previousMonto = 0;
+
+  if (lines.length > 1) {
+    const lastLine = lines.pop();
+    const matches = lastLine.match(/(".*?"|[^",\s]+)(?=\s*,|\s*$)/g);
+    if (matches && matches.length >= 7) {
+      const fecha = matches[0].replace(/"/g, '');
+      const hora = matches[1].replace(/"/g, '');
+      const persona = matches[2].replace(/"/g, '');
+      const oldComercio = matches[3].replace(/"/g, '');
+      const oldDetalle = matches[4].replace(/"/g, '');
+      previousMonto = parseFloat(matches[5].replace(/"/g, '')) || 0;
+      const oldCat = matches[6].replace(/"/g, '');
+      const oldMsg = matches[7] ? matches[7].replace(/"/g, '') : '';
+
+      const newMonto = (monto && monto > 0) ? Number(monto) : previousMonto;
+      const newComercio = (comercio && comercio !== 'Desconocido' && comercio !== 'Varios') ? comercio : oldComercio;
+      const newDetalle = (detalle && detalle !== 'Sin detalle' && detalle !== 'Gasto registrado') ? detalle : oldDetalle;
+      const newCat = (categoria && categoria !== 'Otros') ? categoria : oldCat;
+
+      updatedLocal = {
+        fecha,
+        hora,
+        persona,
+        comercio: newComercio,
+        detalle: newDetalle,
+        monto: newMonto,
+        categoria: newCat
+      };
+
+      const newRow = [
+        escapeCsv(fecha),
+        escapeCsv(hora),
+        escapeCsv(persona),
+        escapeCsv(newComercio),
+        escapeCsv(newDetalle),
+        newMonto,
+        escapeCsv(newCat),
+        escapeCsv(oldMsg)
+      ].join(',');
+
+      lines.push(newRow);
+      fs.writeFileSync(CSV_FILE_PATH, lines.join('\n') + '\n', 'utf8');
+    }
+  }
+
+  const sheetRes = await postToSheetsWebhook({
+    action: 'edit',
+    monto,
+    comercio,
+    detalle,
+    categoria
+  });
+
+  let stats = getMonthlyStatsFromCsv();
+  let updated = updatedLocal;
+
+  if (sheetRes.ok && sheetRes.data && typeof sheetRes.data === 'object') {
+    if (sheetRes.data.stats) stats = sheetRes.data.stats;
+    if (sheetRes.data.updated) updated = sheetRes.data.updated;
+    if (sheetRes.data.previousMonto !== undefined) previousMonto = sheetRes.data.previousMonto;
+  }
+
+  return {
+    ok: Boolean(updated),
+    previousMonto,
+    updated,
+    stats
+  };
+}
+
+/**
+ * Obtiene el resumen sincronizado (consulta primero Google Sheets si devuelve JSON, sino CSV local)
+ */
+async function getSyncedMonthlyStats() {
+  const sheetRes = await postToSheetsWebhook({ action: 'summary' });
+  if (sheetRes.ok && sheetRes.data && typeof sheetRes.data === 'object' && sheetRes.data.stats) {
+    return sheetRes.data.stats;
+  }
+  return getMonthlyStatsFromCsv();
+}
+
 function resetLocalCsv() {
   const headers = 'Fecha,Hora,Persona,Comercio,Detalle,Monto,Categoria,Mensaje Original\n';
   fs.writeFileSync(CSV_FILE_PATH, '\ufeff' + headers, 'utf8');
-
-  const axios = require('axios');
-  axios.post(DEFAULT_SHEETS_URL, { action: 'reset' }).catch(() => {});
+  postToSheetsWebhook({ action: 'reset' }).catch(() => {});
 }
 
 module.exports = {
   recordExpense,
+  undoLastExpense,
+  editLastExpense,
   getMonthlyStatsFromCsv,
+  getSyncedMonthlyStats,
   resetLocalCsv,
   CSV_FILE_PATH
 };
