@@ -71,23 +71,28 @@ function getMonthlyStatsFromCsv() {
   return { totalMes, porPersona };
 }
 
-const DEFAULT_SHEETS_URL = 'https://script.google.com/macros/s/AKfycbyja7RdoBAod6FfcPq1uxhmvDnhOs1oRrr20oONRiPKNlOxfUpAmKa9Rz1NKmG5cSOD/exec';
+const DEFAULT_SHEETS_URL = 'https://script.google.com/macros/s/AKfycbxdXTmMIsXvqQQQfSteeZCtIuJgHyXIqoINvzv01NLMtd-86-eiXyCt6w03Ko0eswVQ/exec';
 
 /**
  * Guarda en Google Sheets mediante Webhook de Google Apps Script (el método más sencillo y rápido)
  */
 async function saveExpenseToGoogleSheetsWebhook(expenseData) {
-  const webhookUrl = process.env.GOOGLE_SHEET_WEBHOOK_URL || DEFAULT_SHEETS_URL;
-  if (!webhookUrl) return false;
-  try {
-    const axios = require('axios');
-    const res = await axios.post(webhookUrl, expenseData);
-    console.log(`📊 Envío a Google Sheets: Status ${res.status} (${res.data})`);
-    return true;
-  } catch (err) {
-    console.error('❌ Error al enviar a Google Sheets Webhook:', err.message);
-    return false;
+  const axios = require('axios');
+  const urlsToTry = [DEFAULT_SHEETS_URL];
+  if (process.env.GOOGLE_SHEET_WEBHOOK_URL && process.env.GOOGLE_SHEET_WEBHOOK_URL !== DEFAULT_SHEETS_URL) {
+    urlsToTry.push(process.env.GOOGLE_SHEET_WEBHOOK_URL);
   }
+
+  for (const url of urlsToTry) {
+    try {
+      const res = await axios.post(url, expenseData);
+      console.log(`📊 Envío a Google Sheets: Status ${res.status} (${res.data})`);
+      return true;
+    } catch (err) {
+      console.warn(`⚠️ Intento en ${url.slice(-15)} falló: ${err.message}`);
+    }
+  }
+  return false;
 }
 
 /**
@@ -180,10 +185,13 @@ async function recordExpense({ persona, monto, comercio, detalle, categoria, men
   };
 }
 
-// Reiniciar archivo CSV local a cero
+// Reiniciar archivo CSV local y Google Sheets a cero
 function resetLocalCsv() {
   const headers = 'Fecha,Hora,Persona,Comercio,Detalle,Monto,Categoria,Mensaje Original\n';
   fs.writeFileSync(CSV_FILE_PATH, '\ufeff' + headers, 'utf8');
+
+  const axios = require('axios');
+  axios.post(DEFAULT_SHEETS_URL, { action: 'reset' }).catch(() => {});
 }
 
 module.exports = {
