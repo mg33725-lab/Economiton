@@ -71,18 +71,21 @@ function getMonthlyStatsFromCsv() {
   return { totalMes, porPersona };
 }
 
+const DEFAULT_SHEETS_URL = 'https://script.google.com/macros/s/AKfycbyja7RdoBAod6FfcPq1uxhmvDnhOs1oRrr20oONRiPKNlOxfUpAmKa9Rz1NKmG5cSOD/exec';
+
 /**
  * Guarda en Google Sheets mediante Webhook de Google Apps Script (el método más sencillo y rápido)
  */
 async function saveExpenseToGoogleSheetsWebhook(expenseData) {
-  const webhookUrl = process.env.GOOGLE_SHEET_WEBHOOK_URL;
+  const webhookUrl = process.env.GOOGLE_SHEET_WEBHOOK_URL || DEFAULT_SHEETS_URL;
   if (!webhookUrl) return false;
   try {
     const axios = require('axios');
-    await axios.post(webhookUrl, expenseData);
+    const res = await axios.post(webhookUrl, expenseData);
+    console.log(`📊 Envío a Google Sheets: Status ${res.status} (${res.data})`);
     return true;
   } catch (err) {
-    console.error('Error al enviar a Google Sheets Webhook:', err.message);
+    console.error('❌ Error al enviar a Google Sheets Webhook:', err.message);
     return false;
   }
 }
@@ -92,7 +95,7 @@ async function saveExpenseToGoogleSheetsWebhook(expenseData) {
  */
 async function saveExpenseToGoogleSheets(expenseData) {
   // 1. Probar primero si hay Webhook URL configurado
-  if (process.env.GOOGLE_SHEET_WEBHOOK_URL) {
+  if (process.env.GOOGLE_SHEET_WEBHOOK_URL || DEFAULT_SHEETS_URL) {
     return await saveExpenseToGoogleSheetsWebhook(expenseData);
   }
 
